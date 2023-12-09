@@ -14,9 +14,12 @@ function get_param_store()
     return PARAM_STORE
 end
 
+struct Messenger
+    fn::Function
+end
 
 mutable struct Trace
-    fn::Function
+    m::Messenger
     trace::Dict{String, Any}
 end
 
@@ -52,6 +55,7 @@ function get_trace(t: trace, args...)
 end
 
 mutable struct Block
+    m::Messenger
     fn::Function
     hide_fn::Function
 end
@@ -63,6 +67,7 @@ function process_message(b::Block, msg)
 end
 
 mutable struct Replay
+    m::Messenger
     fn::Function
     guide_trace::Function
 end
@@ -73,6 +78,18 @@ function process_message(r:Replay, msg)
     end
 end
 
+mutable struct Plate
+    m::Messenger
+    fn::Function
+    size::Int
+    dim::Int
+end
+
+
+# make plate an iterator
+Base.iterate(p::PlateMessenger, state=1) = state > p.size ? nothing : (state, state + 1)
+Base.length(p::PlateMessenger) = p.size
+Base.eltype(::Type{PlateMessenger}) = Int
 
 function sample(name, fn, args...; kwargs...)
     obs = kwargs.pop("obs", nothing)
@@ -89,4 +106,77 @@ function sample(name, fn, args...; kwargs...)
     }
     msg = apply_stack(initial_msg)
     return msg["value"]
+end
+
+
+struct Adam
+    optim_args
+    optim_objs
+end
+
+function Adam(optim_args)
+    optim_objs = Dict()
+    return Adam(optim_args, optim_objs)
+end
+
+function (optimizer::Adam)(params)
+    for param in params
+        if haskey(optimizer.optim_objs, param)
+            optim = optimizer.optim_objs[param]
+        else
+            optim = Flux.ADAM([param], optimizer.optim_args...)
+            optimizer.optim_objs[param] = optim
+        end
+        Flux.Optimise.update!(optim, [param], [grad(param)])
+    end
+end
+
+function elbo(model, guide, args...; kwargs...)
+    guide_trace = trace(() -> guide(args...; kwargs...))
+    model_trace = trace(() -> replay(model, guide_trace)(args...; kwargs...))
+    
+    elbo_val = 0.0
+    for (name, site) in model_trace
+        if site.type == "sample"
+            elbo_val += sum(site.log_prob(site.value))
+        end
+    end
+    for (name, site) in guide_trace
+        if site.type == "sample"
+            elbo_val -= sum(site.log_prob(site.value))
+        end
+    end
+    return -elbo_val
+end
+
+
+struct SVI
+    model
+    guide
+    optim
+    loss
+end
+
+function step(svi::SVI, args...; kwargs...)
+    # This wraps both the call to `model` and `guide` in a `trace` so that
+    # we can record all the parameters that are encountered. Note that
+    # further tracing occurs inside of `loss`.
+    param_capture = trace() do
+        # We use block here to allow tracing to record parameters only.
+        block(hide_fn = msg -> msg["type"] == "sample") do
+            loss = svi.loss(svi.model, svi.guide, args...; kwargs...)
+        end
+    end
+    # Differentiate the loss.
+    Flux.back!(loss)
+    # #TODO unconstrained and constrained parameters equivalent in flux
+    params = [site["value"] for site in values(param_capture)]
+    # Take a step w.r.t. each parameter in params.
+    svi.optim(params)
+    # Zero out the gradients so that they don't accumulate.
+    # TODO check if this is valid
+    for p in params
+        p.grad .= zeros(size(p))
+    end
+    return loss.data
 end
