@@ -109,6 +109,36 @@ function sample(name, fn, args...; kwargs...)
 end
 
 
+function param(name, init_value=nothing; constraint=identity, event_dim=nothing)
+    if event_dim !== nothing
+        error("event_dim argument is not supported")
+    end
+
+    function param_fn(init_value, constraint)
+        if haskey(PARAM_STORE, name)
+            unconstrained_value, _ = PARAM_STORE[name]
+        else
+            @assert init_value !== nothing "Initial value must be provided"
+            constrained_value = deepcopy(init_value)
+            unconstrained_value = Flux.data(constraint(constrained_value))
+            unconstrained_value = Flux.param(unconstrained_value)
+            PARAM_STORE[name] = unconstrained_value, constraint
+        end
+        return constraint(unconstrained_value)
+    end
+
+    if isempty(PYRO_STACK)
+        return param_fn(init_value, constraint)
+    else
+        initial_msg = (type="param", name=name, fn=param_fn, args=(init_value, constraint), value=nothing)
+        msg = apply_stack(initial_msg)
+        return msg.value
+    end
+end
+
+# Placeholder for constraint transformation functions
+identity(x) = x  # Identity function for unconstrained parameters
+
 struct Adam
     optim_args
     optim_objs
