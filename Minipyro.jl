@@ -139,6 +139,36 @@ end
 # Placeholder for constraint transformation functions
 identity(x) = x  # Identity function for unconstrained parameters
 
+function apply_stack(msg)
+    stop_processing = false
+    pointer = 0  # To keep track of where to start the postprocessing
+
+    # Reverse iterate over PYRO_STACK to process the message
+    for handler in reverse(PYRO_STACK)
+        pointer += 1
+        process_message(handler, msg)
+        if get(msg, "stop", false)
+            stop_processing = true
+            break
+        end
+    end
+
+    # Default behavior if no handler has set the value
+    if !haskey(msg, "value") || msg["value"] === nothing
+        msg["value"] = msg["fn"](msg["args"]...)
+    end
+
+    # Postprocess the message
+    if !stop_processing
+        for handler in PYRO_STACK[end:-1:(end-pointer+1)]
+            postprocess_message(handler, msg)
+        end
+    end
+
+    return msg
+end
+
+
 struct Adam
     optim_args
     optim_objs
