@@ -1225,4 +1225,12 @@ function svi_step!(svi::SVI, args...; kwargs...)
     return loss_val
 end
 
+# =============================================================================
+# MCMC Inference (HMC and NUTS)
+# =============================================================================
+
+# Include the MCMC submodule which provides HMC and NUTS samplers.
+# The MCMC module is self-contained with its own exports.
+include("mcmc/mcmc.jl")
+
 end # module MiniPyro

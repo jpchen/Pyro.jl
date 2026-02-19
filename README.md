@@ -9,7 +9,8 @@ MiniPyro.jl is a didactic implementation that demonstrates the core concepts of 
 - **Probabilistic Primitives**: `sample()` and `param()` for defining probabilistic models
 - **Effect Handlers**: Composable handlers for tracing, replaying, and blocking
 - **Variational Inference**: ELBO loss function and SVI optimizer
-- **Automatic Differentiation**: Built on Zygote.jl for gradient computation
+- **MCMC Inference**: HMC and NUTS (No-U-Turn Sampler) with automatic adaptation
+- **Automatic Differentiation**: Built on Zygote.jl (SVI) and ForwardDiff.jl (MCMC)
 - **Distribution Support**: Uses Distributions.jl for probability distributions
 
 ## Installation
@@ -38,10 +39,12 @@ MiniPyro.jl is a didactic implementation that demonstrates the core concepts of 
 
    This will install all required dependencies:
    - `Distributions.jl` - Probability distributions
-   - `Zygote.jl` - Automatic differentiation
+   - `Zygote.jl` - Automatic differentiation (SVI)
+   - `ForwardDiff.jl` - Automatic differentiation (MCMC)
    - `Optimisers.jl` - Optimization algorithms
    - `Random` - Random number generation (stdlib)
    - `Statistics` - Statistical functions (stdlib)
+   - `LinearAlgebra` - Linear algebra operations (stdlib)
 
 ### Quick Start
 
@@ -144,11 +147,164 @@ Validation:
 ✓ Success! Guide location is within 0.1 of true mean (3.0)
 ```
 
+## MCMC Inference (HMC / NUTS)
+
+MiniPyro includes a full MCMC inference stack with HMC (Hamiltonian Monte Carlo) and NUTS (No-U-Turn Sampler), modeled after Pyro's implementation.
+
+### Quick Start: NUTS Sampling
+
+```julia
+include("src/MiniPyro.jl")
+using .MiniPyro
+using .MiniPyro.MCMC
+using Random
+
+Random.seed!(42)
+
+# Step 1: Define your model as a potential energy function.
+# The potential energy is the negative log joint density: U(z) = -log p(z, data)
+# z is the vector of unconstrained parameters to infer.
+
+# Example: Bayesian linear regression y = w*x + b + noise
+x_data = randn(50)
+y_data = 2.5 .* x_data .+ (-1.0) .+ 0.5 .* randn(50)
+
+function potential_fn(z)
+    w, b = z[1], z[2]
+    # Prior: w ~ N(0, 1), b ~ N(0, 1)
+    lp = -0.5 * w^2 - 0.5 * b^2
+    # Likelihood: y_i ~ N(w*x_i + b, 0.5)
+    for i in 1:length(x_data)
+        residual = y_data[i] - (w * x_data[i] + b)
+        lp += -0.5 * (residual / 0.5)^2 - log(0.5)
+    end
+    return -lp  # potential = negative log joint
+end
+
+# Step 2: Create a kernel (NUTS or HMC)
+kernel = NUTSKernel(potential_fn)
+
+# Step 3: Run MCMC
+result = run_mcmc(kernel, 1000, [0.0, 0.0]; warmup_steps=500)
+
+# Step 4: Inspect results
+println("Posterior mean: ", mean(result))  # Should be ≈ [2.5, -1.0]
+println("Posterior std:  ", std(result))
+
+# Access raw samples (Matrix: num_samples x dim)
+samples = result.samples
+w_samples = samples[:, 1]
+b_samples = samples[:, 2]
+```
+
+### Using HMC Instead of NUTS
+
+```julia
+# HMC requires specifying the number of leapfrog steps manually
+kernel = HMCKernel(potential_fn; step_size=0.1, num_steps=10)
+result = run_mcmc(kernel, 1000, [0.0, 0.0]; warmup_steps=500)
+```
+
+### Kernel Options
+
+**NUTSKernel** (recommended for most problems):
+```julia
+NUTSKernel(
+    potential_fn;
+    step_size=1.0,              # Initial step size (auto-tuned)
+    adapt_step_size=true,       # Adapt step size during warmup
+    adapt_mass_matrix=true,     # Adapt mass matrix during warmup
+    target_accept_prob=0.8,     # Target Metropolis acceptance rate
+    max_tree_depth=10           # Max binary tree depth (up to 2^10 leapfrog steps)
+)
+```
+
+**HMCKernel**:
+```julia
+HMCKernel(
+    potential_fn;
+    step_size=1.0,              # Leapfrog step size (auto-tuned)
+    num_steps=10,               # Number of leapfrog steps per proposal
+    adapt_step_size=true,       # Adapt step size during warmup
+    adapt_mass_matrix=true,     # Adapt mass matrix during warmup
+    target_accept_prob=0.8      # Target Metropolis acceptance rate
+)
+```
+
+### Diagnostics
+
+```julia
+result = run_mcmc(kernel, 1000, initial_params; warmup_steps=500)
+
+# Check diagnostics
+diag = result.diagnostics
+println("Step size: ", diag["step_size"])
+println("Divergences: ", diag["divergences"])    # Should be 0
+println("Mean tree depth: ", diag["mean_tree_depth"])  # NUTS only
+println("Accept prob: ", diag["accept_prob"])     # NUTS
+# or diag["accept_rate"] for HMC
+```
+
+### Running MCMC Tests Only
+
+```bash
+# Run MCMC-specific tests
+julia --project=. test/test_mcmc.jl
+
+# Run the full test suite (includes both SVI and MCMC tests)
+julia --project=. test/runtests.jl
+```
+
+### MCMC Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│                  run_mcmc()                    │
+│  Orchestrator: warmup → adapt → sample        │
+└─────────────────┬────────────────────────────┘
+                  │
+    ┌─────────────┴─────────────┐
+    │                           │
+┌───┴──────────┐     ┌─────────┴──────┐
+│  HMCKernel   │     │  NUTSKernel    │
+│  Fixed L     │     │  Adaptive L    │
+│  steps       │     │  (tree build)  │
+└───┬──────────┘     └─────────┬──────┘
+    │                           │
+    └─────────────┬─────────────┘
+                  │
+    ┌─────────────┴─────────────┐
+    │   velocity_verlet()       │
+    │   Leapfrog integrator     │
+    └─────────────┬─────────────┘
+                  │
+    ┌─────────────┴─────────────┐
+    │  potential_energy_grad()   │
+    │  ForwardDiff.jl autodiff   │
+    └───────────────────────────┘
+
+    ┌───────────────────────────┐
+    │     WarmupAdapter         │
+    │  ┌─────────────────────┐  │
+    │  │   DualAveraging     │  │  ← Step size adaptation
+    │  └─────────────────────┘  │
+    │  ┌─────────────────────┐  │
+    │  │ WelfordCovariance   │  │  ← Mass matrix estimation
+    │  └─────────────────────┘  │
+    └───────────────────────────┘
+```
+
 ## Running Tests
 
 ```bash
-# Run the full test suite
+# Run the full test suite (SVI + MCMC)
 julia --project=. test/runtests.jl
+
+# Run only the core SVI tests
+julia --project=. test/runtests.jl
+
+# Run only MCMC tests
+julia --project=. test/test_mcmc.jl
 ```
 
 Or from the Julia REPL:
@@ -260,6 +416,50 @@ value, constraint = store["param_name"]
 constrained_value = constraint(value)
 ```
 
+### MCMC Inference
+
+#### `NUTSKernel(potential_fn; kwargs...)`
+
+Create a NUTS kernel for MCMC sampling.
+
+```julia
+using .MiniPyro.MCMC
+
+potential_fn(z) = 0.5 * sum(z .^ 2)  # Standard normal target
+kernel = NUTSKernel(potential_fn; max_tree_depth=10)
+result = run_mcmc(kernel, 1000, zeros(2); warmup_steps=500)
+```
+
+#### `HMCKernel(potential_fn; kwargs...)`
+
+Create an HMC kernel for MCMC sampling.
+
+```julia
+kernel = HMCKernel(potential_fn; step_size=0.1, num_steps=10)
+result = run_mcmc(kernel, 1000, zeros(2); warmup_steps=500)
+```
+
+#### `run_mcmc(kernel, num_samples, initial_params; kwargs...)`
+
+Run MCMC inference and return an `MCMCResult`.
+
+```julia
+result = run_mcmc(kernel, 1000, zeros(2); warmup_steps=500, progress=true)
+samples = result.samples          # Matrix (num_samples x dim)
+posterior_mean = mean(result)     # Vector of posterior means
+posterior_std = std(result)       # Vector of posterior stds
+```
+
+#### `potential_energy_from_model(logpdf_fn)`
+
+Convert a log-pdf function to a potential energy function.
+
+```julia
+logpdf_fn(z) = -0.5 * sum(z .^ 2)  # log N(0, I)
+potential_fn = potential_energy_from_model(logpdf_fn)
+# potential_fn(z) = -logpdf_fn(z) = 0.5 * sum(z .^ 2)
+```
+
 ## Architecture
 
 MiniPyro uses the **effect handler** pattern for implementing probabilistic programming primitives. This design allows:
@@ -306,15 +506,21 @@ MiniPyro uses the **effect handler** pattern for implementing probabilistic prog
 | SVI | ✓ | ✓ |
 | ELBO | ✓ | ✓ |
 | Plates | Partial | Basic |
-| MCMC/HMC | ✓ | Separate |
+| HMC | ✓ | ✓ |
+| NUTS | ✓ | ✓ |
+| Step size adaptation | ✓ | ✓ (Dual averaging) |
+| Mass matrix adaptation | ✓ | ✓ (Welford diagonal) |
 | Neural Networks | PyTorch | Flux.jl |
 | JIT compilation | ✓ | Julia native |
 
 ## Dependencies
 
 - [Distributions.jl](https://github.com/JuliaStats/Distributions.jl) - Probability distributions
-- [Zygote.jl](https://github.com/FluxML/Zygote.jl) - Automatic differentiation
+- [Zygote.jl](https://github.com/FluxML/Zygote.jl) - Automatic differentiation (SVI)
+- [ForwardDiff.jl](https://github.com/JuliaDiff/ForwardDiff.jl) - Automatic differentiation (MCMC)
+- [DiffResults.jl](https://github.com/JuliaDiff/DiffResults.jl) - Efficient gradient+value computation
 - [Optimisers.jl](https://github.com/FluxML/Optimisers.jl) - Optimization algorithms
+- [LinearAlgebra](https://docs.julialang.org/en/v1/stdlib/LinearAlgebra/) - Linear algebra (stdlib)
 
 ## References
 
@@ -322,6 +528,8 @@ MiniPyro uses the **effect handler** pattern for implementing probabilistic prog
 - [Original minipyro.py](https://github.com/pyro-ppl/pyro/blob/dev/pyro/contrib/minipyro.py)
 - [Effect Handlers Tutorial](http://pyro.ai/examples/effect_handlers.html)
 - [SVI Tutorial](http://pyro.ai/examples/svi_part_i.html)
+- Hoffman & Gelman (2014) "The No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian Monte Carlo"
+- Betancourt (2017) "A Conceptual Introduction to Hamiltonian Monte Carlo"
 
 ## License
 

@@ -476,5 +476,14 @@ end
 
 println()
 println("=" ^ 60)
-println("All tests completed!")
+println("Core MiniPyro tests completed!")
 println("=" ^ 60)
+
+# =============================================================================
+# MCMC Tests (HMC / NUTS)
+# =============================================================================
+
+println()
+println("Running MCMC test suite...")
+println()
+include("test_mcmc.jl")
